@@ -17,7 +17,8 @@ def home():
 def run_flask():
     port = int(os.environ.get("PORT", 10000))
     app_flask.run(host='0.0.0.0', port=port)
-
+    
+flask_thread = Thread(target=run_flask, daemon=True)
 Thread(target=run_flask).start()
 
 # Логирование
