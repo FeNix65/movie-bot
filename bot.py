@@ -5,7 +5,7 @@ from telegram.ext import Application, CallbackQueryHandler, CommandHandler, Mess
 from telegram.error import BadRequest
 from flask import Flask
 from threading import Thread
-from supabase import create_client, Client
+import httpx
 
 # Flask для keep-alive
 app_flask = Flask(__name__)
@@ -32,8 +32,15 @@ BOT_TOKEN = os.environ.get("BOT_TOKEN")
 SUPABASE_URL = os.environ.get("SUPABASE_URL")
 SUPABASE_KEY = os.environ.get("SUPABASE_KEY")
 
-# Подключение к Supabase
-supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
+# HTTP клиент для Supabase
+http_client = httpx.Client(
+    base_url=f"{SUPABASE_URL}/rest/v1",
+    headers={
+        "apikey": SUPABASE_KEY,
+        "Authorization": f"Bearer {SUPABASE_KEY}",
+        "Content-Type": "application/json"
+    }
+)
 
 waiting_for_input = {}
 
@@ -85,46 +92,54 @@ DEFAULT_MOVIES = [
 ]
 
 def init_db():
-    """Создаём таблицу если её нет"""
+    """Добавляем дефолтные фильмы если таблица пустая"""
     try:
-        # Проверяем существование таблицы
-        supabase.table('movies').select('count', count='exact').execute()
-    except:
-        # Если таблицы нет — создаём через SQL (в Supabase dashboard)
-        logger.info("Таблица movies не найдена, создай вручную в Supabase dashboard")
-    
-    # Добавляем дефолтные фильмы если таблица пустая
-    result = supabase.table('movies').select('*').execute()
-    if len(result.data) == 0:
-        for movie in DEFAULT_MOVIES:
-            try:
-                supabase.table('movies').insert({"title": movie, "watched": False}).execute()
-            except Exception as e:
-                logger.error(f"Ошибка добавления {movie}: {e}")
+        response = http_client.get("/movies?select=*")
+        movies = response.json()
+        
+        if len(movies) == 0:
+            for movie in DEFAULT_MOVIES:
+                try:
+                    http_client.post("/movies", json={"title": movie, "watched": False})
+                except Exception as e:
+                    logger.error(f"Ошибка добавления {movie}: {e}")
+            logger.info("Добавлены дефолтные фильмы")
+    except Exception as e:
+        logger.error(f"Ошибка инициализации: {e}")
 
 def get_all_movies():
     """Получить все фильмы"""
-    result = supabase.table('movies').select('*').order('id').execute()
-    return result.data
+    try:
+        response = http_client.get("/movies?select=*&order=id")
+        return response.json()
+    except Exception as e:
+        logger.error(f"Ошибка получения фильмов: {e}")
+        return []
 
 def add_movie(title):
     """Добавить фильм"""
     try:
-        supabase.table('movies').insert({"title": title, "watched": False}).execute()
-        return True
-    except Exception as e:
-        if 'duplicate' in str(e).lower():
-            return False
+        response = http_client.post("/movies", json={"title": title, "watched": False})
+        return response.status_code == 201
+    except httpx.HTTPStatusError as e:
+        if e.response.status_code == 409:
+            return False  # Дубликат
         logger.error(f"Ошибка добавления: {e}")
         return False
 
 def delete_movie(movie_id):
     """Удалить фильм"""
-    supabase.table('movies').delete().eq('id', movie_id).execute()
+    try:
+        http_client.delete(f"/movies?id=eq.{movie_id}")
+    except Exception as e:
+        logger.error(f"Ошибка удаления: {e}")
 
 def toggle_watched(movie_id, watched):
     """Переключить статус просмотра"""
-    supabase.table('movies').update({"watched": watched}).eq('id', movie_id).execute()
+    try:
+        http_client.patch(f"/movies?id=eq.{movie_id}", json={"watched": watched})
+    except Exception as e:
+        logger.error(f"Ошибка обновления: {e}")
 
 def build_main_keyboard():
     """Клавиатура для непросмотренных фильмов"""
