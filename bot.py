@@ -1,4 +1,3 @@
-import json
 import os
 import logging
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
@@ -6,8 +5,9 @@ from telegram.ext import Application, CallbackQueryHandler, CommandHandler, Mess
 from telegram.error import BadRequest
 from flask import Flask
 from threading import Thread
+import sqlite3
 
-# Flask для keep-alive (Render требует порт)
+# Flask для keep-alive
 app_flask = Flask(__name__)
 
 @app_flask.route('/')
@@ -18,18 +18,17 @@ def run_flask():
     port = int(os.environ.get("PORT", 10000))
     app_flask.run(host='0.0.0.0', port=port)
 
-# Запускаем Flask в отдельном потоке
 Thread(target=run_flask).start()
 
-# Остальной код бота
+# Логирование
 logging.basicConfig(
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
     level=logging.INFO
 )
 logger = logging.getLogger(__name__)
 
-BOT_TOKEN = os.environ.get("BOT_TOKEN")  # Берём из переменных окружения
-DATA_FILE = "movies.json"
+BOT_TOKEN = os.environ.get("BOT_TOKEN")
+DB_FILE = "movies.db"
 
 waiting_for_input = {}
 
@@ -80,48 +79,99 @@ DEFAULT_MOVIES = [
     "Сверхъестественное (сериал) [S1E6]"
 ]
 
-def load_data():
-    if os.path.exists(DATA_FILE):
-        with open(DATA_FILE, 'r', encoding='utf-8') as f:
-            return json.load(f)
-    return {"movies": [{"title": m, "watched": False} for m in DEFAULT_MOVIES]}
+def init_db():
+    """Создаём таблицу если её нет"""
+    conn = sqlite3.connect(DB_FILE)
+    c = conn.cursor()
+    c.execute('''CREATE TABLE IF NOT EXISTS movies
+                 (id INTEGER PRIMARY KEY AUTOINCREMENT,
+                  title TEXT UNIQUE,
+                  watched BOOLEAN DEFAULT 0)''')
+    
+    # Добавляем дефолтные фильмы если таблица пустая
+    c.execute("SELECT COUNT(*) FROM movies")
+    if c.fetchone()[0] == 0:
+        for movie in DEFAULT_MOVIES:
+            try:
+                c.execute("INSERT INTO movies (title, watched) VALUES (?, 0)", (movie,))
+            except:
+                pass
+    
+    conn.commit()
+    conn.close()
 
-def save_data(data):
-    with open(DATA_FILE, 'w', encoding='utf-8') as f:
-        json.dump(data, f, ensure_ascii=False, indent=2)
+def get_all_movies():
+    """Получить все фильмы"""
+    conn = sqlite3.connect(DB_FILE)
+    c = conn.cursor()
+    c.execute("SELECT id, title, watched FROM movies ORDER BY id")
+    movies = [{"id": row[0], "title": row[1], "watched": bool(row[2])} for row in c.fetchall()]
+    conn.close()
+    return movies
+
+def add_movie(title):
+    """Добавить фильм"""
+    conn = sqlite3.connect(DB_FILE)
+    c = conn.cursor()
+    try:
+        c.execute("INSERT INTO movies (title, watched) VALUES (?, 0)", (title,))
+        conn.commit()
+        conn.close()
+        return True
+    except sqlite3.IntegrityError:
+        conn.close()
+        return False
+
+def delete_movie(movie_id):
+    """Удалить фильм"""
+    conn = sqlite3.connect(DB_FILE)
+    c = conn.cursor()
+    c.execute("DELETE FROM movies WHERE id = ?", (movie_id,))
+    conn.commit()
+    conn.close()
+
+def toggle_watched(movie_id, watched):
+    """Переключить статус просмотра"""
+    conn = sqlite3.connect(DB_FILE)
+    c = conn.cursor()
+    c.execute("UPDATE movies SET watched = ? WHERE id = ?", (1 if watched else 0, movie_id))
+    conn.commit()
+    conn.close()
 
 def build_main_keyboard():
-    data = load_data()
+    """Клавиатура для непросмотренных фильмов"""
+    movies = get_all_movies()
     keyboard = []
     
-    unwatched_movies = [(idx, m) for idx, m in enumerate(data["movies"]) if not m["watched"]]
+    unwatched = [(m["id"], m) for m in movies if not m["watched"]]
     
-    for idx, movie in unwatched_movies:
+    for movie_id, movie in unwatched:
         keyboard.append([
-            InlineKeyboardButton(f"⬜️ {movie['title'][:40]}{'...' if len(movie['title']) > 40 else ''}", callback_data=f"toggle_{idx}")
+            InlineKeyboardButton(f"⬜️ {movie['title'][:40]}{'...' if len(movie['title']) > 40 else ''}", callback_data=f"toggle_{movie_id}")
         ])
     
     keyboard.append([
-        InlineKeyboardButton("Добавить фильм", callback_data="add"),
-        InlineKeyboardButton("Удалить фильм", callback_data="delete_mode")
+        InlineKeyboardButton("➕ Добавить фильм", callback_data="add"),
+        InlineKeyboardButton("🗑 Удалить фильм", callback_data="delete_mode")
     ])
     
-    watched_count = len([m for m in data["movies"] if m["watched"]])
+    watched_count = len([m for m in movies if m["watched"]])
     keyboard.append([
-        InlineKeyboardButton(f"Просмотренные ({watched_count})", callback_data="watched_list"),
-        InlineKeyboardButton("Статистика", callback_data="stats")
+        InlineKeyboardButton(f"✅ Просмотренные ({watched_count})", callback_data="watched_list"),
+        InlineKeyboardButton("📊 Статистика", callback_data="stats")
     ])
     
     return InlineKeyboardMarkup(keyboard)
 
 def build_watched_keyboard():
-    data = load_data()
+    """Клавиатура для просмотренных фильмов"""
+    movies = get_all_movies()
     keyboard = []
     
-    for idx, movie in enumerate(data["movies"]):
+    for movie in movies:
         if movie["watched"]:
             keyboard.append([
-                InlineKeyboardButton(f"✅ {movie['title'][:40]}{'...' if len(movie['title']) > 40 else ''}", callback_data=f"unwatch_{idx}")
+                InlineKeyboardButton(f"✅ {movie['title'][:40]}{'...' if len(movie['title']) > 40 else ''}", callback_data=f"unwatch_{movie['id']}")
             ])
     
     keyboard.append([
@@ -131,13 +181,14 @@ def build_watched_keyboard():
     return InlineKeyboardMarkup(keyboard)
 
 def build_delete_keyboard():
-    data = load_data()
+    """Клавиатура для удаления"""
+    movies = get_all_movies()
     keyboard = []
     
-    for idx, movie in enumerate(data["movies"]):
+    for movie in movies:
         emoji = "✅" if movie["watched"] else "⬜️"
         keyboard.append([
-            InlineKeyboardButton(f"🗑 {emoji} {movie['title'][:35]}{'...' if len(movie['title']) > 35 else ''}", callback_data=f"del_{idx}")
+            InlineKeyboardButton(f"🗑 {emoji} {movie['title'][:35]}{'...' if len(movie['title']) > 35 else ''}", callback_data=f"del_{movie['id']}")
         ])
     
     keyboard.append([InlineKeyboardButton("🔙 Отмена", callback_data="back_to_main")])
@@ -146,13 +197,13 @@ def build_delete_keyboard():
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
-    data = load_data()
-    unwatched = len([m for m in data["movies"] if not m["watched"]])
-    watched = len([m for m in data["movies"] if m["watched"]])
+    movies = get_all_movies()
+    unwatched = len([m for m in movies if not m["watched"]])
+    watched = len([m for m in movies if m["watched"]])
     
     try:
         await update.message.reply_text(
-            f"<b>Список к просмотру</b>\n\n"
+            f"🎬 <b>Список к просмотру</b>\n\n"
             f"⬜️ Осталось: {unwatched}\n"
             f"✅ Просмотрено: {watched}\n\n"
             f"Нажми на фильм, чтобы отметить просмотренным",
@@ -171,36 +222,37 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
         except Exception as e2:
             logger.error(f"Вторая ошибка: {e2}")
-            await update.message.reply_text("Ошибка загрузки списка. Попробуй в личных сообщениях.")
+            await update.message.reply_text("Ошибка загрузки списка.")
 
 async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
     data = query.data
     chat_id = update.effective_chat.id
-    movies_data = load_data()
     
     try:
         if data.startswith("toggle_"):
-            idx = int(data.split("_")[1])
-            movies_data["movies"][idx]["watched"] = True
-            save_data(movies_data)
+            movie_id = int(data.split("_")[1])
+            toggle_watched(movie_id, True)
+            movies = get_all_movies()
+            movie = next((m for m in movies if m["id"] == movie_id), None)
             
             await query.edit_message_text(
-                f"<b>Список к просмотру</b>\n\n"
-                f"✅ Отмечено: <i>{movies_data['movies'][idx]['title']}</i>",
+                f"🎬 <b>Список к просмотру</b>\n\n"
+                f"✅ Отмечено: <i>{movie['title'] if movie else 'Фильм'}</i>",
                 reply_markup=build_main_keyboard(),
                 parse_mode="HTML"
             )
         
         elif data.startswith("unwatch_"):
-            idx = int(data.split("_")[1])
-            movies_data["movies"][idx]["watched"] = False
-            save_data(movies_data)
+            movie_id = int(data.split("_")[1])
+            toggle_watched(movie_id, False)
+            movies = get_all_movies()
+            movie = next((m for m in movies if m["id"] == movie_id), None)
             
             await query.edit_message_text(
                 f"✅ <b>Просмотренные</b>\n\n"
-                f"⬜️ Вернуто в список: <i>{movies_data['movies'][idx]['title']}</i>",
+                f"⬜️ Вернуто в список: <i>{movie['title'] if movie else 'Фильм'}</i>",
                 reply_markup=build_watched_keyboard(),
                 parse_mode="HTML"
             )
@@ -208,7 +260,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         elif data == "add":
             waiting_for_input[chat_id] = {"action": "add"}
             await query.edit_message_text(
-                f"<b>Добавление фильма</b>\n\n"
+                f"📝 <b>Добавление фильма</b>\n\n"
                 f"Напиши название фильма в ответ на это сообщение:",
                 parse_mode="HTML"
             )
@@ -222,19 +274,21 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
         
         elif data.startswith("del_"):
-            idx = int(data.split("_")[1])
-            deleted = movies_data["movies"].pop(idx)
-            save_data(movies_data)
+            movie_id = int(data.split("_")[1])
+            movies = get_all_movies()
+            movie = next((m for m in movies if m["id"] == movie_id), None)
+            delete_movie(movie_id)
             
             await query.edit_message_text(
-                f"🗑 Удалено: <i>{deleted['title']}</i>\n\n"
-                f"<b>Список к просмотру</b>",
+                f"🗑 Удалено: <i>{movie['title'] if movie else 'Фильм'}</i>\n\n"
+                f"🎬 <b>Список к просмотру</b>",
                 reply_markup=build_main_keyboard(),
                 parse_mode="HTML"
             )
         
         elif data == "watched_list":
-            watched_movies = [m for m in movies_data["movies"] if m["watched"]]
+            movies = get_all_movies()
+            watched_movies = [m for m in movies if m["watched"]]
             
             if not watched_movies:
                 await query.answer("Пока нет просмотренных фильмов!", show_alert=True)
@@ -248,11 +302,12 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
         
         elif data == "back_to_main":
-            unwatched = len([m for m in movies_data["movies"] if not m["watched"]])
-            watched = len([m for m in movies_data["movies"] if m["watched"]])
+            movies = get_all_movies()
+            unwatched = len([m for m in movies if not m["watched"]])
+            watched = len([m for m in movies if m["watched"]])
             
             await query.edit_message_text(
-                f"<b>Список к просмотру</b>\n\n"
+                f"🎬 <b>Список к просмотру</b>\n\n"
                 f"⬜️ Осталось: {unwatched}\n"
                 f"✅ Просмотрено: {watched}\n\n"
                 f"Нажми на фильм, чтобы отметить просмотренным",
@@ -261,12 +316,13 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
         
         elif data == "stats":
-            total = len(movies_data["movies"])
-            watched = len([m for m in movies_data["movies"] if m["watched"]])
+            movies = get_all_movies()
+            total = len(movies)
+            watched = len([m for m in movies if m["watched"]])
             percent = (watched / total * 100) if total > 0 else 0
             
             await query.edit_message_text(
-                f"<b>Статистика</b>\n\n"
+                f"📊 <b>Статистика</b>\n\n"
                 f"Всего фильмов: {total}\n"
                 f"✅ Просмотрено: {watched}\n"
                 f"⬜️ Осталось: {total - watched}\n"
@@ -277,10 +333,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             
     except BadRequest as e:
         logger.error(f"Ошибка в кнопке: {e}")
-        if "Topic_closed" in str(e):
-            await query.answer("Ошибка: тема закрыта. Напиши боту в личку.", show_alert=True)
-        else:
-            await query.answer("Ошибка обработки. Попробуй еще раз.", show_alert=True)
+        await query.answer("Ошибка обработки. Попробуй еще раз.", show_alert=True)
 
 async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
@@ -293,38 +346,34 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text("❌ Слишком короткое название")
             return
         
-        movies_data = load_data()
-        
-        for m in movies_data["movies"]:
-            if m["title"].lower() == text.lower():
-                await update.message.reply_text(f"⚠️ '{text}' уже есть в списке!")
-                return
-        
-        movies_data["movies"].append({"title": text, "watched": False})
-        save_data(movies_data)
-        
-        unwatched = len([m for m in movies_data["movies"] if not m["watched"]])
-        watched = len([m for m in movies_data["movies"] if m["watched"]])
-        
-        try:
-            await update.message.reply_text(
-                f"✅ Добавлено: <i>{text}</i>\n\n"
-                f"<b>Список к просмотру</b>\n"
-                f"⬜️ Осталось: {unwatched}\n"
-                f"✅ Просмотрено: {watched}",
-                reply_markup=build_main_keyboard(),
-                parse_mode="HTML"
-            )
-        except BadRequest:
-            await update.message.reply_text(
-                f"✅ Добавлено: {text}\n\n"
-                f"Список к просмотру\n"
-                f"Осталось: {unwatched}\n"
-                f"Просмотрено: {watched}",
-                reply_markup=build_main_keyboard()
-            )
+        if add_movie(text):
+            movies = get_all_movies()
+            unwatched = len([m for m in movies if not m["watched"]])
+            watched = len([m for m in movies if m["watched"]])
+            
+            try:
+                await update.message.reply_text(
+                    f"✅ Добавлено: <i>{text}</i>\n\n"
+                    f"🎬 <b>Список к просмотру</b>\n"
+                    f"⬜️ Осталось: {unwatched}\n"
+                    f"✅ Просмотрено: {watched}",
+                    reply_markup=build_main_keyboard(),
+                    parse_mode="HTML"
+                )
+            except BadRequest:
+                await update.message.reply_text(
+                    f"✅ Добавлено: {text}\n\n"
+                    f"Список к просмотру\n"
+                    f"Осталось: {unwatched}\n"
+                    f"Просмотрено: {watched}",
+                    reply_markup=build_main_keyboard()
+                )
+        else:
+            await update.message.reply_text(f"⚠️ '{text}' уже есть в списке!")
 
 def main():
+    init_db()  # Инициализируем базу при старте
+    
     app = Application.builder().token(BOT_TOKEN).build()
 
     app.add_handler(CommandHandler("start", start))
