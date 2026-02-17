@@ -16,10 +16,12 @@ def home():
 
 def run_flask():
     port = int(os.environ.get("PORT", 10000))
-    app_flask.run(host='0.0.0.0', port=port)
+    # Важно: debug=False и use_reloader=False чтобы не было двойного запуска
+    app_flask.run(host='0.0.0.0', port=port, debug=False, use_reloader=False)
     
+# Исправлено: правильный запуск потока
 flask_thread = Thread(target=run_flask, daemon=True)
-Thread(target=run_flask).start()
+flask_thread.start()
 
 # Логирование
 logging.basicConfig(
@@ -32,6 +34,14 @@ logger = logging.getLogger(__name__)
 BOT_TOKEN = os.environ.get("BOT_TOKEN")
 SUPABASE_URL = os.environ.get("SUPABASE_URL")
 SUPABASE_KEY = os.environ.get("SUPABASE_KEY")
+
+# Проверка переменных
+if not BOT_TOKEN:
+    logger.error("BOT_TOKEN не найден!")
+if not SUPABASE_URL:
+    logger.error("SUPABASE_URL не найден!")
+if not SUPABASE_KEY:
+    logger.error("SUPABASE_KEY не найден!")
 
 # HTTP клиент для Supabase
 http_client = httpx.Client(
@@ -105,6 +115,8 @@ def init_db():
                 except Exception as e:
                     logger.error(f"Ошибка добавления {movie}: {e}")
             logger.info("Добавлены дефолтные фильмы")
+        else:
+            logger.info(f"В базе уже {len(movies)} фильмов")
     except Exception as e:
         logger.error(f"Ошибка инициализации: {e}")
 
@@ -122,9 +134,7 @@ def add_movie(title):
     try:
         response = http_client.post("/movies", json={"title": title, "watched": False})
         return response.status_code == 201
-    except httpx.HTTPStatusError as e:
-        if e.response.status_code == 409:
-            return False  # Дубликат
+    except Exception as e:
         logger.error(f"Ошибка добавления: {e}")
         return False
 
@@ -376,15 +386,17 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text(f"⚠️ '{text}' уже есть в списке!")
 
 def main():
+    logger.info("Инициализация базы данных...")
     init_db()
     
+    logger.info("Запуск бота...")
     app = Application.builder().token(BOT_TOKEN).build()
 
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CallbackQueryHandler(button_handler))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
 
-    logger.info("Бот запущен...")
+    logger.info("Бот запущен и готов к работе!")
     app.run_polling(allowed_updates=Update.ALL_TYPES)
 
 if __name__ == "__main__":
