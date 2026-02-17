@@ -5,7 +5,7 @@ from telegram.ext import Application, CallbackQueryHandler, CommandHandler, Mess
 from telegram.error import BadRequest
 from flask import Flask
 from threading import Thread
-import sqlite3
+from supabase import create_client, Client
 
 # Flask для keep-alive
 app_flask = Flask(__name__)
@@ -27,8 +27,13 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+# Переменные окружения
 BOT_TOKEN = os.environ.get("BOT_TOKEN")
-DB_FILE = "movies.db"
+SUPABASE_URL = os.environ.get("SUPABASE_URL")
+SUPABASE_KEY = os.environ.get("SUPABASE_KEY")
+
+# Подключение к Supabase
+supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
 
 waiting_for_input = {}
 
@@ -81,62 +86,45 @@ DEFAULT_MOVIES = [
 
 def init_db():
     """Создаём таблицу если её нет"""
-    conn = sqlite3.connect(DB_FILE)
-    c = conn.cursor()
-    c.execute('''CREATE TABLE IF NOT EXISTS movies
-                 (id INTEGER PRIMARY KEY AUTOINCREMENT,
-                  title TEXT UNIQUE,
-                  watched BOOLEAN DEFAULT 0)''')
+    try:
+        # Проверяем существование таблицы
+        supabase.table('movies').select('count', count='exact').execute()
+    except:
+        # Если таблицы нет — создаём через SQL (в Supabase dashboard)
+        logger.info("Таблица movies не найдена, создай вручную в Supabase dashboard")
     
     # Добавляем дефолтные фильмы если таблица пустая
-    c.execute("SELECT COUNT(*) FROM movies")
-    if c.fetchone()[0] == 0:
+    result = supabase.table('movies').select('*').execute()
+    if len(result.data) == 0:
         for movie in DEFAULT_MOVIES:
             try:
-                c.execute("INSERT INTO movies (title, watched) VALUES (?, 0)", (movie,))
-            except:
-                pass
-    
-    conn.commit()
-    conn.close()
+                supabase.table('movies').insert({"title": movie, "watched": False}).execute()
+            except Exception as e:
+                logger.error(f"Ошибка добавления {movie}: {e}")
 
 def get_all_movies():
     """Получить все фильмы"""
-    conn = sqlite3.connect(DB_FILE)
-    c = conn.cursor()
-    c.execute("SELECT id, title, watched FROM movies ORDER BY id")
-    movies = [{"id": row[0], "title": row[1], "watched": bool(row[2])} for row in c.fetchall()]
-    conn.close()
-    return movies
+    result = supabase.table('movies').select('*').order('id').execute()
+    return result.data
 
 def add_movie(title):
     """Добавить фильм"""
-    conn = sqlite3.connect(DB_FILE)
-    c = conn.cursor()
     try:
-        c.execute("INSERT INTO movies (title, watched) VALUES (?, 0)", (title,))
-        conn.commit()
-        conn.close()
+        supabase.table('movies').insert({"title": title, "watched": False}).execute()
         return True
-    except sqlite3.IntegrityError:
-        conn.close()
+    except Exception as e:
+        if 'duplicate' in str(e).lower():
+            return False
+        logger.error(f"Ошибка добавления: {e}")
         return False
 
 def delete_movie(movie_id):
     """Удалить фильм"""
-    conn = sqlite3.connect(DB_FILE)
-    c = conn.cursor()
-    c.execute("DELETE FROM movies WHERE id = ?", (movie_id,))
-    conn.commit()
-    conn.close()
+    supabase.table('movies').delete().eq('id', movie_id).execute()
 
 def toggle_watched(movie_id, watched):
     """Переключить статус просмотра"""
-    conn = sqlite3.connect(DB_FILE)
-    c = conn.cursor()
-    c.execute("UPDATE movies SET watched = ? WHERE id = ?", (1 if watched else 0, movie_id))
-    conn.commit()
-    conn.close()
+    supabase.table('movies').update({"watched": watched}).eq('id', movie_id).execute()
 
 def build_main_keyboard():
     """Клавиатура для непросмотренных фильмов"""
@@ -372,7 +360,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text(f"⚠️ '{text}' уже есть в списке!")
 
 def main():
-    init_db()  # Инициализируем базу при старте
+    init_db()
     
     app = Application.builder().token(BOT_TOKEN).build()
 
